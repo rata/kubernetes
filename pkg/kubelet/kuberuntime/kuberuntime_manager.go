@@ -478,6 +478,7 @@ func containerSucceeded(c *v1.Container, podStatus *kubecontainer.PodStatus) boo
 // computePodActions checks whether the pod spec has changed and returns the changes if true.
 func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *kubecontainer.PodStatus) podActions {
 	klog.V(5).Infof("Syncing Pod %q: %+v", format.Pod(pod), pod)
+	klog.Error("XXX: rata: check 0")
 
 	createPodSandbox, attempt, sandboxID := m.podSandboxChanged(pod, podStatus)
 	changes := podActions{
@@ -492,6 +493,7 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 	// If we need to (re-)create the pod sandbox, everything will need to be
 	// killed and recreated, and init containers should be purged.
 	if createPodSandbox {
+		klog.Errorf("XXX: rata: check 0.1")
 		if !shouldRestartOnFailure(pod) && attempt != 0 && len(podStatus.ContainerStatuses) != 0 {
 			// Should not restart the pod, just return.
 			// we should not create a sandbox for a pod if it is already done.
@@ -511,14 +513,43 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		}
 		// Start all containers by default but exclude the ones that succeeded if
 		// RestartPolicy is OnFailure.
+		//for idx, c := range pod.Spec.Containers {
+		//	if containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
+		//		continue
+		//	}
+		//	changes.ContainersToStart = append(changes.ContainersToStart, idx)
+		//}
+
+		// TODO: sidecars are ready before we continue
+
+		klog.Errorf("XXX: rata: check 0.5")
+		sidecars, rest := getContainersIdxByType(pod)
+		klog.Errorf("XXX: rata: sidecars %v, rest %v", sidecars, rest)
+
+		containersToStart := sidecars
+		if len(sidecars) == 0 {
+			containersToStart = rest
+		}
+
 		for idx, c := range pod.Spec.Containers {
+			// start sidecars first, if any
+			// if not, start the rest
+			if _, ok := containersToStart[idx]; !ok {
+				continue
+			}
+
+			// TODO: this probably doesn't apply for sidecars?
 			if containerSucceeded(&c, podStatus) && pod.Spec.RestartPolicy == v1.RestartPolicyOnFailure {
 				continue
 			}
 			changes.ContainersToStart = append(changes.ContainersToStart, idx)
 		}
+
 		return changes
+
 	}
+
+	klog.Errorf("XXX: rata: check 0.10.0")
 
 	// Ephemeral containers may be started even if initialization is not yet complete.
 	if utilfeature.DefaultFeatureGate.Enabled(features.EphemeralContainers) {
@@ -555,6 +586,100 @@ func (m *kubeGenericRuntimeManager) computePodActions(pod *v1.Pod, podStatus *ku
 		// Initialization failed or still in progress. Skip inspecting non-init
 		// containers.
 		return changes
+	}
+
+	// TODO: start sidecar containers and wait for them to be ready
+	// TODO: check what we can reuse from init containers above and regular
+	// containers bellow
+	klog.Error("XXX: rata: check 1")
+	sidecars, rest := getContainersIdxByType(pod)
+	klog.Errorf("XXX: rata: sidecars %v, rest %v", sidecars, rest)
+
+	if len(sidecars) != 0 {
+		klog.Errorf("XXX: rata: checking sidecars ready")
+		allReady := true
+		for idx, container := range pod.Spec.Containers {
+			if _, ok := sidecars[idx]; !ok {
+				continue
+			}
+
+			// TODO: alto bardo de status
+			for _, status := range pod.Status.ContainerStatuses {
+
+				if status.Name != container.Name {
+					continue
+				}
+
+				// If container is ready, nothing else to do
+				// here
+				if status.Ready {
+					continue
+				}
+				allReady = false
+
+				specStatus := podStatus.FindContainerStatusByName(container.Name)
+				if specStatus == nil {
+					klog.Errorf("XXX: rata: checking sidecars 1")
+					continue
+				}
+				state := specStatus.State
+
+				// TODO: review if this is correct
+				// TODO: add check if container ready
+				if state == kubecontainer.ContainerStateRunning {
+					klog.Errorf("XXX: rata: checking sidecars 3")
+					continue
+				}
+
+				// If failed or exit, this container should be started
+				if isContainerFailed(specStatus) || state == kubecontainer.ContainerStateExited {
+					klog.Errorf("XXX: rata: checking sidecars 4")
+					changes.ContainersToStart = append(changes.ContainersToStart, idx)
+				}
+
+				// TODO: kill unknown state containers and add them to
+				// start?
+
+				//changes.ContainersToStart = append(changes.ContainersToStart, idx)
+			}
+		}
+
+		if !allReady {
+			return changes
+		}
+	}
+
+	// TODO: Add logic to trigger next step when sidecars are ready, instead
+	// of relying on sync being called again when containers are not ready
+	klog.Errorf("XXX: rata: checking sidecars ready: completed")
+
+	// Start non-sidecars containers
+	if len(rest) != 0 {
+		klog.Errorf("XXX: rata: non-sidecars: 1")
+		allStarted := true
+		for idx, container := range pod.Spec.Containers {
+			if _, ok := rest[idx]; !ok {
+				continue
+			}
+			for _, status := range pod.Status.ContainerStatuses {
+				if status.Name != container.Name {
+					continue
+				}
+				klog.Errorf("XXX: rata: non-sidecar: checking %q", container.Name)
+
+				// TODO: this is a hack, we should check for
+				// proper status
+				klog.Errorf("XXX: rata: non-sidecar: status.Started", status.Started, "*status.Started", *status.Started)
+				if status.Started != nil && !*status.Started {
+					allStarted = false
+					changes.ContainersToStart = append(changes.ContainersToStart, idx)
+				}
+			}
+		}
+
+		if !allStarted {
+			return changes
+		}
 	}
 
 	// Number of running containers to keep.

@@ -153,6 +153,19 @@ func isInitContainerFailed(status *kubecontainer.ContainerStatus) bool {
 	return false
 }
 
+// TODO: rename and reuse func above
+func isContainerFailed(status *kubecontainer.ContainerStatus) bool {
+	if status.State == kubecontainer.ContainerStateExited && status.ExitCode != 0 {
+		return true
+	}
+
+	if status.State == kubecontainer.ContainerStateUnknown {
+		return true
+	}
+
+	return false
+}
+
 // getStableKey generates a key (string) to uniquely identify a
 // (pod, container) tuple. The key should include the content of the
 // container, so that any change to the container generates a new key.
