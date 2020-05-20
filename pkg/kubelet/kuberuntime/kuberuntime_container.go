@@ -611,6 +611,36 @@ func (m *kubeGenericRuntimeManager) killContainer(pod *v1.Pod, containerID kubec
 	return err
 }
 
+func getSidecarAnn(containerName string) string {
+	return fmt.Sprintf("alpha.kinvolk.io/sidecar-%v", containerName)
+}
+
+func getPodGracePeriod(pod *v1.Pod, gracePeriodOverride *int64) int64 {
+
+	// XXX: killContainer calls the internal preStop hook before this.
+	// Should we do that? Not sure, check later
+
+	gracePeriod := int64(minimumGracePeriodInSeconds)
+	switch {
+	case pod.DeletionGracePeriodSeconds != nil:
+		gracePeriod = *pod.DeletionGracePeriodSeconds
+	case pod.Spec.TerminationGracePeriodSeconds != nil:
+		gracePeriod = *pod.Spec.TerminationGracePeriodSeconds
+	}
+
+	// always give containers a minimal shutdown window to avoid unnecessary SIGKILLs
+	if gracePeriod < minimumGracePeriodInSeconds {
+		gracePeriod = minimumGracePeriodInSeconds
+	}
+
+	if gracePeriodOverride != nil {
+		gracePeriod = *gracePeriodOverride
+	}
+
+	return gracePeriod
+
+}
+
 func getContainersIdxByType(pod *v1.Pod) (map[int]struct{}, map[int]struct{}) {
 	sidecars := map[int]struct{}{}
 	rest := map[int]struct{}{}
@@ -621,7 +651,7 @@ func getContainersIdxByType(pod *v1.Pod) (map[int]struct{}, map[int]struct{}) {
 
 	for idx, c := range pod.Spec.Containers {
 		// check for annotation saying a container is a sidecar
-		c_ann := fmt.Sprintf("alpha.kinvolk.io/sidecar-%v", c.Name)
+		c_ann := getSidecarAnn(c.Name)
 
 		if _, isSidecar := ann[c_ann]; isSidecar {
 			sidecars[idx] = struct{}{}
@@ -641,26 +671,32 @@ func getContainersByType(pod *v1.Pod, runningPod kubecontainer.Pod) (sidecars, r
 
 	//klog.Warningf("XXX: rata, rest es %q", rest)
 
+	// TODO: review this, but seems to be the case
 	// pod is nil when doesn't exist already in k8s. We should keep the same
 	// behaviour as before in that case and return runningPod.Containers
+	// Another option is to do as killContainer does to restore info
 	rest = runningPod.Containers
 	if pod == nil {
+		klog.Error("XXX: rata cont: pod is nil")
 		return
 	}
 	if pod.Annotations == nil {
+		klog.Error("XXX: rata cont: pod.Ann is nil")
 		return
 	}
 	ann := pod.Annotations
 
 	if runningPod.Containers == nil {
+		klog.Error("XXX: rata cont: runningpod.Con is nil")
 		return
 	}
 
 	rest = nil
 
 	for _, c := range runningPod.Containers {
+		klog.Error("XXX: rata cont: iterating runningpod.Con ")
 		// check for annotation saying a container is a sidecar
-		c_ann := fmt.Sprintf("alpha.kinvolk.io/sidecar=%v", c.Name)
+		c_ann := getSidecarAnn(c.Name)
 
 		if _, isSidecar := ann[c_ann]; isSidecar {
 			sidecars = append(sidecars, c)
@@ -668,6 +704,80 @@ func getContainersByType(pod *v1.Pod, runningPod kubecontainer.Pod) (sidecars, r
 			rest = append(rest, c)
 		}
 	}
+	klog.Error("XXX: rata cont: finishing")
+	return
+}
+
+// TODO: docs saying returns remaining gracePeriod
+func (m *kubeGenericRuntimeManager) runSidecarsPreStopHooks(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (remGracePeriod int64) {
+	// XXX: killContainer calls the internal preStop hook before this.
+	// Should we do that? Not sure, check later
+
+	klog.Error("XXX: rata runSidecarsPreStopHooks: 0")
+	remGracePeriod = getPodGracePeriod(pod, gracePeriodOverride)
+
+	// This is c&p from killContainer(). Doing this to make diff easier to
+	// backport instead of moving to a function.
+
+	// TODO: better name and consider the func just returning this instead of
+	// creating it here
+	sidecars, _ := getContainersByType(pod, runningPod)
+
+	klog.Error("XXX: rata runSidecarsPreStopHooks: 1")
+
+	// XXX: killContainer calls the internal preStop hook before this.
+	// Should we do that? Not sure, check later
+	klog.Errorf("XXX: rata kill: sidecars is %v", sidecars)
+
+	wg := sync.WaitGroup{}
+	wg.Add(len(sidecars))
+
+	start := time.Now()
+
+	klog.Error("XXX: rata runSidecarsPreStopHooks: 2")
+	for _, container := range sidecars {
+		container := container
+		klog.Warning("XXX: rata kill :: before preStop")
+
+		// XXX: Can this be simplified, instead?
+		var containerSpec *v1.Container
+		if pod != nil {
+			if containerSpec = kubecontainer.GetContainerSpec(pod, container.Name); containerSpec == nil {
+				// TODO: handle errors
+				klog.Error("XXX: rata: ERROR 1")
+				//klog.Errorf("XXX: rata: failed to get containerSpec %q(id=%q) in pod %q when running preStop",
+				//	container.Name, container.ID.String(), format.Pod(pod))
+				return
+			}
+		} else {
+			// Restore necessary information if one of the specs is nil.
+			_, restoredContainer, err := m.restoreSpecsFromContainerLabels(container.ID)
+			if err != nil {
+				klog.Errorf("XXX: rata: Error running preStop for sidecars, can't get pod info: %v", err)
+				klog.Error("XXX: rata: ERROR 2")
+				//klog.Errorf("XXX: rata: failed to get containerSpec %q(id=%q) in pod %q when running preStop",
+				return
+			}
+			containerSpec = restoredContainer
+		}
+
+		// TODO: double check go clousure with loops, just in case
+		go func() {
+			defer wg.Done()
+
+			// TODO: take this time into account for grace period
+			if containerSpec.Lifecycle != nil && containerSpec.Lifecycle.PreStop != nil && remGracePeriod > 0 {
+				m.executePreStopHook(pod, container.ID, containerSpec, remGracePeriod)
+			}
+		}()
+	}
+	wg.Wait()
+
+	klog.Error("XXX: rata runSidecarsPreStopHooks: 9")
+	timeElapsed := int64(time.Since(start).Seconds())
+
+	remGracePeriod = remGracePeriod - timeElapsed
+
 	return
 }
 
@@ -675,50 +785,56 @@ func getContainersByType(pod *v1.Pod, runningPod kubecontainer.Pod) (sidecars, r
 func (m *kubeGenericRuntimeManager) killContainersWithSyncResult(pod *v1.Pod, runningPod kubecontainer.Pod, gracePeriodOverride *int64) (syncResults []*kubecontainer.SyncResult) {
 	containerResults := make(chan *kubecontainer.SyncResult, len(runningPod.Containers))
 
+	// TODO: pod might be nil, handle it correctly
+	if pod == nil {
+		klog.Error("XXX: rata cont: killContainersWithSyncResult pod is nil")
+		return
+	}
+
+	// TODO: check that it is very close to zero if no preStop hook is used
+	klog.Error("XXX: rata cont: killContainersWithSyncResult 0")
+	remGracePeriod := m.runSidecarsPreStopHooks(pod, runningPod, gracePeriodOverride)
+	klog.Error("XXX: rata cont: killContainersWithSyncResult remGracePeriod", remGracePeriod)
+	if gracePeriodOverride != nil {
+		klog.Error("XXX: rata cont: killContainersWithSyncResult remGracePeriod", remGracePeriod, "override", *gracePeriodOverride)
+		*gracePeriodOverride = *gracePeriodOverride - remGracePeriod
+		if *gracePeriodOverride <= 0 {
+			gracePeriodOverride = nil
+		}
+	}
+
+	// TODO: better name and consider the func just returning this instead of
+	// creating it here
 	sidecars, rest := getContainersByType(pod, runningPod)
+	containersOrder := [][]*kubecontainer.Container{sidecars, rest}
 
 	wg := sync.WaitGroup{}
-	wg.Add(len(rest))
+	// TODO remove i after debug prints
+	for i, containers := range containersOrder {
 
-	//wg.Add(len(runningPod.Containers))
+		wg.Add(len(containers))
 
-	// TODO: What do we want to do regarding preStop hook?
+		klog.Warningf("XXX: rata kill containers iter: %v", i)
+		for _, container := range containers {
+			//for _, container := range runningPod.Containers {
+			go func(container *kubecontainer.Container) {
+				defer utilruntime.HandleCrash()
+				defer wg.Done()
 
-	klog.Warningf("XXX: rata kill 1")
-	// TODO: move this to a function, to avoid c&p
-	for _, container := range rest {
-		//for _, container := range runningPod.Containers {
-		go func(container *kubecontainer.Container) {
-			defer utilruntime.HandleCrash()
-			defer wg.Done()
+				killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
+				// TODO: calculate elapsed time and use anoter
+				// graceSecondsPeriod?
+				if err := m.killContainer(pod, container.ID, container.Name, "", gracePeriodOverride); err != nil {
+					killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
+				}
+				containerResults <- killContainerResult
+			}(container)
+		}
 
-			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
-			if err := m.killContainer(pod, container.ID, container.Name, "", gracePeriodOverride); err != nil {
-				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
-			}
-			containerResults <- killContainerResult
-		}(container)
+		wg.Wait()
+
+		klog.Warningf("XXX: rata kill finishing iter %v", i)
 	}
-
-	wg.Wait()
-
-	klog.Warningf("XXX: rata kill 2")
-	wg.Add(len(sidecars))
-	for _, container := range sidecars {
-		go func(container *kubecontainer.Container) {
-			defer utilruntime.HandleCrash()
-			defer wg.Done()
-
-			killContainerResult := kubecontainer.NewSyncResult(kubecontainer.KillContainer, container.Name)
-			// TODO: calculate elapsed time and use anoter
-			// graceSecondsPeriod?
-			if err := m.killContainer(pod, container.ID, container.Name, "", gracePeriodOverride); err != nil {
-				killContainerResult.Fail(kubecontainer.ErrKillContainer, err.Error())
-			}
-			containerResults <- killContainerResult
-		}(container)
-	}
-	wg.Wait()
 
 	klog.Warningf("XXX: rata kill 3")
 
